@@ -5,7 +5,7 @@ import time
 # ----- CONFIG -----
 SERIAL_PORT = 'COM3'     # Change this to your ESP32 COM port
 BAUD_RATE = 115200
-SEND_INTERVAL = 0.1      # Seconds between sends
+SEND_INTERVAL = 0.02      # Seconds between sends
 
 # ----- INIT SERIAL -----
 try:
@@ -34,12 +34,13 @@ try:
 
         # Read axes
         x_axis = -joystick.get_axis(0)  # Left-right
-        thr = -joystick.get_axis(5) # Forward-backward (inverted)  
-        brk = -joystick.get_axis(4)
+        thr = -joystick.get_axis(2) # Forward-backward (inverted)  
+        brk = -joystick.get_axis(1)
 
         # Map values
         steering = int((x_axis + 1) * 68)
-        throttle = int(((1 - thr) / 2 * 256)-((1 - brk) / 2 * 256))
+        throttle = int(((1 - thr) / 2 * 256)-((1 - brk) / 2
+                                              * 256))
 
         # Send over serial
         cmd = f"{throttle} {steering}\n"
