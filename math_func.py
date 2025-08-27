@@ -2,7 +2,6 @@ import numpy as np
 import cv2 as cv
 
 
-
 def dist_between_points(p1, p2):
     return np.sqrt(abs(p1[0]-p2[0])**2 + abs(p1[1]-p2[1])**2)
 
@@ -18,6 +17,42 @@ def picture_diference(im1, im2):
     change_map = cv.normalize(diff, None, 0, 255, cv.NORM_MINMAX)
     return diff
 
+class low_pass_filter:
+    def __init__(self, alpha=0.5):
+        self.alpha = alpha
+        self.prev = None
+
+    def apply(self, value):
+        if self.prev is None:
+            self.prev = value
+            return value
+        filtered = self.alpha * value + (1 - self.alpha) * self.prev
+        self.prev = filtered
+        return filtered
+
+class pid:
+    def __init__(self, kp=1.0, ki=0.0, kd=0.0):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.prev_error = 0.0
+        self.integral = 0.0
+
+    def reset(self):
+        self.prev_error = 0.0
+        self.integral = 0.0
+
+    def compute(self, error, dt=1.0):
+        self.integral += error * dt
+        derivative = (error - self.prev_error) / dt if dt > 0 else 0.0
+        output = self.kp * error + self.ki * self.integral + self.kd * derivative
+        self.prev_error = error
+        return output
+
+
+def angle_beetween_points(p1, p2):
+    """Return angle in radians from p1 to p2."""
+    return np.arctan2(p2[1]-p1[1], p2[0]-p1[0])
 
 
 def quadrilateral_center(corners):
@@ -196,3 +231,47 @@ def center_of_change(change_map):
     cy = np.sum(y_coords * change_map) / total_weight
 
     return cx, cy
+
+
+def warp_to_rectangle(image, points):
+    """
+    Takes 4 points from an image and warps that region into a rectangle.
+
+    Parameters:
+        image : np.ndarray
+            The input image (BGR or grayscale).
+        points : list of lists/tuples
+            The 4 points [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] in order:
+            top-left, top-right, bottom-right, bottom-left.
+
+    Returns:
+        warped : np.ndarray
+            The rectangular, perspective-corrected image.
+    """
+    pts_src = np.array(points, dtype="float32")
+
+    # Compute width of new image
+    width_top = np.linalg.norm(pts_src[1] - pts_src[0])
+    width_bottom = np.linalg.norm(pts_src[2] - pts_src[3])
+    max_width = int(max(width_top, width_bottom))
+
+    # Compute height of new image
+    height_left = np.linalg.norm(pts_src[3] - pts_src[0])
+    height_right = np.linalg.norm(pts_src[2] - pts_src[1])
+    max_height = int(max(height_left, height_right))
+
+    # Destination rectangle points
+    pts_dst = np.array([
+        [0, 0],
+        [max_width - 1, 0],
+        [max_width - 1, max_height - 1],
+        [0, max_height - 1]
+    ], dtype="float32")
+
+    # Compute perspective transform
+    M = cv.getPerspectiveTransform(pts_src, pts_dst)
+
+    # Warp image
+    warped = cv.warpPerspective(image, M, (max_width, max_height))
+
+    return warped

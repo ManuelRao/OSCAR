@@ -5,7 +5,7 @@ import time
 # ----- CONFIG -----
 SERIAL_PORT = 'COM3'     # Change this to your ESP32 COM port
 BAUD_RATE = 115200
-SEND_INTERVAL = 0.02      # Seconds between sends
+SEND_INTERVAL = 0.1      # Seconds between sends
 
 # ----- INIT SERIAL -----
 try:
