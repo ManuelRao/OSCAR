@@ -131,9 +131,7 @@ while True:
         # predict next position if we have enough history
         if 'pos_history' in locals() and len(pos_history) >= 3:
             pred_pos, pred_rot, spd_p, acc = mf.predict_next_position(pos_history[-3], pos_history[-2], pos_history[-1], dt)
-            cv.circle(frame, (int(pred_pos[0]), int(pred_pos[1])), 10, (0, 0, 255), -1)
-            cv.putText(frame, f"Predicted: {pred_pos}", (10, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        
+            
         # generate weighted diff map
         if 'diff_map' in locals() and 'pred_pos' in locals() and 'prev_diff_map' in locals():
             weight_map = np.zeros_like(diff_map, dtype=float)
@@ -186,7 +184,7 @@ while True:
     error = (ideal_heading - heading) if 'ideal_heading' in locals() else 0.0
     cv.putText(frame, f"Steering error (rad): {error:.2f}", (10, 120), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
     steering = steering_pid.compute(error, dt) if 'error' in locals() and 'dt' in locals() else 0.0
-    steering = -steering*1 + 68
+    steering = -steering + 68
     
     # show images
     if 'overlay' in locals():
@@ -216,7 +214,7 @@ while True:
     brk = -joystick.get_axis(1)
 
     # Map values
-    steering = int((x_axis + 1) * 68)
+    # steering = int((x_axis + 1) * 68)
     throttle = int(((1 - thr) / 2 * 256)-((1 - brk) / 2
                                             * 256))
 
