@@ -96,11 +96,14 @@ def predict_next_position(p0, p1, p2, dt=10):
     Predict the next position of a moving object using last 3 positions.
     
     Args:
-        p0, p1, p2 : tuple (x,y) - last 3 positions (oldest to newest)
+        (p0, p1, p2) : tuple (x,y) - last 3 positions (oldest to newest)
         dt         : time step between positions (default = 1)
         
     Returns:
         (x_pred, y_pred): predicted next position
+        theta_pred: predicted next theta
+        speed_pred: speed prediction
+        acceleration: acceleration in relation to last frame
     """
     p0, p1, p2 = np.array(p0, dtype=float), np.array(p1, dtype=float), np.array(p2, dtype=float)
 
@@ -275,3 +278,24 @@ def warp_to_rectangle(image, points):
     warped = cv.warpPerspective(image, M, (max_width, max_height))
 
     return warped
+
+def calculate_image_SNR(frame, mask):
+    cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+    signal = np.mean(frame[mask > 0])
+    noise = np.std(frame[mask > 0])
+    if noise == 0:
+        return float('inf')  # Infinite SNR if no noise
+    snr = signal / noise
+    return snr
+
+def calculate_pixel_contrast(frame, mask):
+    # Define a kernel for 8-neighbor differences
+    kernel = np.array([[1, 1, 1],
+                    [1, -8, 1],
+                    [1, 1, 1]], dtype=np.float32)
+
+    # Apply convolution → Laplacian-like filter
+    contrast_map = cv.filter2D(frame[mask > 0], -1, kernel)
+    contrast_map = np.abs(contrast_map)
+    contrast = np.mean(contrast_map)
+    return contrast
