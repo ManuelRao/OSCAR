@@ -1,7 +1,7 @@
 import cv2
 import json
 import os
-import math_func as mf
+from src import math_func as mf
 
 # JSON file for storing points
 POINTS_FILE = "points.json"

@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib as plt
 import json
 import tkinter
-import math_func as mf
+from src import math_func as mf
 import cv2 as cv
 import math
 

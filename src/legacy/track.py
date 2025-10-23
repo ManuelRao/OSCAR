@@ -1,11 +1,11 @@
 import cv2 as cv
 import cv2.aruco as aruco
 import numpy as np
-import math_func as mf
+from src import math_func as mf
 import time
 import serial
 import pygame
-from track_lib import Track
+from .track_lib import Track
 import math
 import json
 
