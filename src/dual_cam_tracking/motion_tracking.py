@@ -100,7 +100,7 @@ class MonoMotionTracker:
             w_diff = np.zeros_like(prev_diff_map, dtype=np.uint8)
         else:
             w_diff = cv.normalize((diff_map.astype(float) * mask), None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
-        combined = cv.normalize((w_diff.astype(float) * prev_diff_map.astype(float)), None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+        combined = cv.addWeighted(w_diff, 0.6, prev_diff_map, 0.4, 0)
         
         if contrast < 1.2:
             # Development fallback: low contrast detected — use previous diff map
