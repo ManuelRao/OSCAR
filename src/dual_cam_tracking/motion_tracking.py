@@ -184,7 +184,7 @@ if __name__ == "__main__":
         traceback.print_exc()
         sys.exit(1)
 
-    tracker.set_debug(True)
+    tracker.set_debug(False)
     print("MonoMotionTracker created. Debug mode ON.")
 
     # camera open check
