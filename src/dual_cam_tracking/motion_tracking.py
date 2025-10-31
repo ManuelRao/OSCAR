@@ -2,6 +2,8 @@ import numpy as np
 import cv2 as cv
 import time
 from collections import deque
+import sys
+import traceback
 
 # Import math_func from package `src`
 from src import math_func as mf
@@ -67,7 +69,8 @@ class MonoMotionTracker:
         # predict next position if we have enough history, otherwise center
         if len(self.pos_hst) >= 3:
             pred_pos, theta, speed, acc = mf.predict_next_position(self.pos_hst[-3], self.pos_hst[-2], self.pos_hst[-1], max(self.dt, 1e-6))
-            print(f"Predicted Position: {pred_pos}, Theta: {theta}, Speed: {speed}, Acceleration: {acc}")
+            if self.debug:
+                print(f"Predicted Position: {pred_pos}, Theta: {theta}, Speed: {speed}, Acceleration: {acc}")
         else:
             pred_pos = (frame.shape[1] / 2, frame.shape[0] / 2)
             theta = 0.0
@@ -172,14 +175,47 @@ if __name__ == "__main__":
                               [0, 0, 1]], dtype=np.float32)
     dist_coeffs = np.zeros((5, 1), dtype=np.float32)
     marker_length = 0.05  # in meters
-    tracker = MonoMotionTracker(camera_matrix, dist_coeffs, marker_length, camera_index=0)
-    tracker.set_debug(True)
 
+    # create tracker and do basic startup diagnostics
+    try:
+        tracker = MonoMotionTracker(camera_matrix, dist_coeffs, marker_length, camera_index=0)
+    except Exception:
+        print("ERROR: failed to create MonoMotionTracker:")
+        traceback.print_exc()
+        sys.exit(1)
+
+    tracker.set_debug(True)
+    print("MonoMotionTracker created. Debug mode ON.")
+
+    # camera open check
+    try:
+        if tracker.camera is None or not tracker.camera.isOpened():
+            print("ERROR: Camera could not be opened. Check the camera index (0) and that no other app uses it.")
+            # show available devices hint (best-effort)
+            print("Tip: try changing camera_index in the script or run a small test script to list devices.")
+            sys.exit(1)
+        else:
+            print("Camera opened successfully.")
+    except Exception:
+        print("ERROR: exception while checking camera:")
+        traceback.print_exc()
+        sys.exit(1)
+
+    # run loop with top-level exception handling so failures are visible
     try:
         while True:
             tracker.process_frame()
     except KeyboardInterrupt:
+        print("Interrupted by user — releasing resources.")
         tracker.release()
+    except Exception:
+        print("Unhandled exception in tracker loop:")
+        traceback.print_exc()
+        try:
+            tracker.release()
+        except Exception:
+            pass
+        sys.exit(1)
 
 
             
