@@ -8,21 +8,42 @@ import traceback
 # Import math_func from package `src`
 from src import math_func as mf
 
+class TwoDTrack:
+    def __init__(self, position=np.array([0.0, 0.0]), velocity=np.array([0.0, 0.0])):
+        self.prev_poss = deque(maxlen=5)
+        self.prev_time = None
+        self.pos = position
+        self.vel = velocity
+
+    def predict_next_position(self, dt):            
+        if len(self.prev_poss) < 3:
+            return self.pos
+        p1 = np.array(self.prev_poss[-3])
+        p2 = np.array(self.prev_poss[-2])
+        p3 = np.array(self.prev_poss[-1])
+        v1 = (p2 - p1) / dt
+        v2 = (p3 - p2) / dt
+        a = (v2 - v1) / dt
+        predicted_pos = p3 + v2 * dt + 0.5 * a * dt * dt
+        return predicted_pos, v2, a
+    
+    def update_position(self, new_position):
+        self.pos = new_position
+
+    def get_position(self):
+        return self.pos
+
+
 class MonoMotionTracker:
     def __init__(self, camera_matrix, dist_coeffs, marker_length, camera_index):
         self.camera_matrix = camera_matrix
         self.dist_coeffs = dist_coeffs
-        self.marker_length = marker_length
-        self.aruco_dict = cv.aruco.getPredefinedDictionary(cv.aruco.DICT_6X6_250)
-        self.parameters = cv.aruco.DetectorParameters()
         self.prev_position = None
         self.prev_time = None
         self.camera = cv.VideoCapture(camera_index)
         # store last time as a timestamp
         self.last_t = time.time()
-        self.pos = []
-        self.vel = []
-        self.pos_hst = deque(maxlen=5)
+        self.tracks = []
         self.dt = 0
         self.prev_gray = None
         # optional debug flag
@@ -39,20 +60,17 @@ class MonoMotionTracker:
                                                              self.camera_matrix, self.dist_coeffs)
         return rvecs, tvecs
 
-    def compute_velocity(self, current_position, current_time):
-        if self.prev_position is None or self.prev_time is None:
-            self.prev_position = current_position
-            self.prev_time = current_time
-            return np.array([0.0, 0.0, 0.0])
-
-        dt = current_time - self.prev_time
-        if dt <= 0:
-            return np.array([0.0, 0.0, 0.0])
-
-        velocity = (current_position - self.prev_position) / dt
-        self.prev_position = current_position
-        self.prev_time = current_time
-        return velocity
+    def detect_posible_tracks(self, frame, old_tracks):
+        new_tracks = []
+        # blob detection
+        blobs = cv.SimpleBlobDetector().detect(frame)
+        for blob in blobs:
+            # Check if the blob is close to any old track
+            for track in old_tracks:
+                if track.is_near(blob):
+                    new_tracks.append(track)
+                    break
+        return new_tracks
 
     def process_frame(self):
         if self.camera is None or not self.camera.isOpened():
@@ -66,16 +84,10 @@ class MonoMotionTracker:
         if frame is None:
             raise ValueError("Captured frame is None.")
         gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+
+
         # predict next position if we have enough history, otherwise center
-        if len(self.pos_hst) >= 3:
-            pred_pos, theta, speed, acc = mf.predict_next_position(self.pos_hst[-3], self.pos_hst[-2], self.pos_hst[-1], max(self.dt, 1e-6))
-            if self.debug:
-                print(f"Predicted Position: {pred_pos}, Theta: {theta}, Speed: {speed}, Acceleration: {acc}")
-        else:
-            pred_pos = (frame.shape[1] / 2, frame.shape[0] / 2)
-            theta = 0.0
-            speed = 0.0
-            acc = 0.0
+        
         mask = np.zeros(frame.shape[:2], dtype=np.uint8)
         cv.circle(mask, (int(pred_pos[0]), int(pred_pos[1])), 50, 255, -1)
         mask = cv.GaussianBlur(mask, (9, 9), 0, dst=mask)
