@@ -65,12 +65,10 @@ class MonoMotionTracker:
         # blob detection
         blobs = cv.SimpleBlobDetector().detect(frame)
         for blob in blobs:
+            # get blob position and calculate SNR
+            pos = np.array([blob.pt[0], blob.pt[1]])
             # Check if the blob is close to any old track
-            for track in old_tracks:
-                if track.is_near(blob):
-                    new_tracks.append(track)
-                    break
-        return new_tracks
+            
 
     def process_frame(self):
         if self.camera is None or not self.camera.isOpened():
@@ -86,7 +84,7 @@ class MonoMotionTracker:
         gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
 
 
-        # predict next position if we have enough history, otherwise center
+        
         
         mask = np.zeros(frame.shape[:2], dtype=np.uint8)
         cv.circle(mask, (int(pred_pos[0]), int(pred_pos[1])), 50, 255, -1)
