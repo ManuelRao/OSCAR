@@ -869,6 +869,10 @@ def main():
     unmatched_tracks_history = deque(maxlen=3)
     show_objects = True
     
+    # Temporal smoothing for diff_map to reduce jumpiness
+    accumulated_diff = None
+    diff_alpha = 0.9  # Blending factor for temporal smoothing
+    
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -882,13 +886,27 @@ def main():
             # Calculate difference map
             diff_map = mf.picture_diference(gray, prev_gray)
             
-            # Process diff_map: normalize, blur, threshold
+            # Process diff_map: normalize first
             diff_map = cv.normalize(diff_map, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
-            diff_map = cv.GaussianBlur(diff_map, (9, 9), 4)
-            diff_map = cv.threshold(diff_map, 30, 255, cv.THRESH_BINARY)[1]
+            
+            # Apply temporal smoothing to reduce jumpiness from lighting/camera changes
+            if accumulated_diff is None:
+                accumulated_diff = diff_map.astype(np.float32)
+            else:
+                # Blend current diff with accumulated: new = alpha*current + (1-alpha)*previous
+                accumulated_diff = diff_alpha * diff_map.astype(np.float32) + (1 - diff_alpha) * accumulated_diff
+            
+            # Use the smoothed diff map
+            diff_map_smoothed = accumulated_diff.astype(np.uint8)
+            
+            # Lighter blur to preserve detail
+            diff_map_smoothed = cv.GaussianBlur(diff_map_smoothed, (5, 5), 2)
+            
+            # Lower threshold to capture more subtle changes
+            diff_map_final = cv.threshold(diff_map_smoothed, 20, 255, cv.THRESH_BINARY)[1]
             
             # Detect blobs in the thresholded diff_map
-            keypoints = blob_detector.detect(diff_map)
+            keypoints = blob_detector.detect(diff_map_final)
             
             # Convert keypoints to BlobInfo objects with velocity calculation
             current_time = time.time()
@@ -924,9 +942,9 @@ def main():
                 if track.id in track_assignments:
                     track.update(track_assignments[track.id], frame_count)
             
-            # Update activity status for all tracks based on diff_map
+            # Update activity status for all tracks based on final diff_map
             for track in tracks:
-                track.update_activity_status(diff_map)
+                track.update_activity_status(diff_map_final)
             
             # Add unmatched blobs to history
             unmatched_history.append(unmatched_blobs)
@@ -1019,8 +1037,8 @@ def main():
             # Store blobs for next frame
             prev_blobs = blobs
             
-            # Display diff_map
-            cv.imshow("Diff Map", diff_map)
+            # Display smoothed diff_map (final processed version)
+            cv.imshow("Diff Map", diff_map_final)
             
             # Create visualization frame
             vis_frame = frame.copy()
@@ -1139,7 +1157,7 @@ def main():
             
             # Debug views
             if show_debug:
-                colored_diff = cv.applyColorMap(diff_map, cv.COLORMAP_JET)
+                colored_diff = cv.applyColorMap(diff_map_final, cv.COLORMAP_JET)
                 cv.imshow("Diff Map (Colored)", colored_diff)
                 
                 overlay = cv.addWeighted(frame, 0.3, colored_diff, 0.7, 0)
@@ -1211,8 +1229,8 @@ def main():
                     pass
             
             # Statistics
-            mean_diff = np.mean(diff_map)
-            max_diff = np.max(diff_map)
+            mean_diff = np.mean(diff_map_final)
+            max_diff = np.max(diff_map_final)
             num_blobs = len(keypoints)
             
             # Info text
@@ -1257,9 +1275,9 @@ def main():
             print("Quitting...")
             break
         elif key == ord('s'):
-            if 'diff_map' in locals():
+            if 'diff_map_final' in locals():
                 filename = f"diff_map_{saved_count:03d}.png"
-                cv.imwrite(filename, diff_map)
+                cv.imwrite(filename, diff_map_final)
                 print(f"Saved: {filename}")
                 saved_count += 1
         elif key == ord('d'):
@@ -1304,6 +1322,7 @@ def main():
             prev_blobs = []
             unmatched_history.clear()
             unmatched_tracks_history.clear()
+            accumulated_diff = None  # Reset temporal smoothing
             Track.next_id = 0
             # Reset all object importance maps before clearing
             for obj in objects:
@@ -1311,7 +1330,7 @@ def main():
                     obj.importance_map.reset()
             objects.clear()
             Object.next_id = 0
-            print("Reset - cleared previous frame, all tracks, objects, and importance maps")
+            print("Reset - cleared previous frame, all tracks, objects, importance maps, and temporal buffer")
     
     cap.release()
     cv.destroyAllWindows()
