@@ -54,3 +54,4 @@ except KeyboardInterrupt:
 finally:
     ser.close()
     pygame.quit()
+    

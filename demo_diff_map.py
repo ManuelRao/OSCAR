@@ -60,6 +60,13 @@ class Track:
         self.total_updates = 1
         self.certainty = 0.0  # 0-1 scale, increases with stability
         
+        # Smoothing factor for gradual position updates
+        self.alpha = 0.4  # 0=no change, 1=instant change (lower = smoother)
+        
+        # Activity tracking - monitor diff_map activity in track's area
+        self.frames_with_no_activity = 0  # Count frames with zero diff_map activity
+        self.activity_check_radius = 20  # Radius to check for activity
+        
         self.color = tuple(np.random.randint(50, 255, 3).tolist())
     
     def get_certainty(self):
@@ -90,24 +97,33 @@ class Track:
         return self.position + self.velocity * dt
     
     def update(self, matched_blobs, frame_id):
-        """Update track with matched blobs."""
+        """Update track with matched blobs using smoothing for gradual transitions."""
         if not matched_blobs:
             self.frames_since_update += 1
             return
         
-        # Calculate new position as weighted average of blob positions
-        blob_positions = np.array([blob.pos for blob in matched_blobs])
-        new_position = np.mean(blob_positions, axis=0)
+        # Reset activity counter when we have blobs (there's activity)
+        self.frames_with_no_activity = 0
         
-        # Update velocity if we have history
+        # Calculate raw new position as weighted average of blob positions
+        blob_positions = np.array([blob.pos for blob in matched_blobs])
+        raw_new_position = np.mean(blob_positions, axis=0)
+        
+        # Apply low-pass filter for smooth position updates
+        # position = alpha * raw + (1-alpha) * previous
+        smoothed_position = self.alpha * raw_new_position + (1 - self.alpha) * self.position
+        
+        # Update velocity if we have history (use smoothed position)
         if len(self.position_history) >= 2:
             prev_pos, prev_frame = self.position_history[-1]
             dt = max(frame_id - prev_frame, 1)
-            self.velocity = (new_position - prev_pos) / dt
+            raw_velocity = (smoothed_position - prev_pos) / dt
+            # Also smooth velocity
+            self.velocity = self.alpha * raw_velocity + (1 - self.alpha) * self.velocity
         
         # Update position and history
-        self.position = new_position
-        self.position_history.append((new_position.copy(), frame_id))
+        self.position = smoothed_position
+        self.position_history.append((smoothed_position.copy(), frame_id))
         
         # Update blob tracking
         self.blobs = matched_blobs
@@ -117,15 +133,50 @@ class Track:
         self.frames_since_update = 0
         self.total_updates += 1
     
+    def check_area_activity(self, diff_map):
+        """
+        Check if there's any activity (non-zero pixels) in the track's area.
+        Returns True if activity detected, False if area is completely inactive.
+        """
+        x, y = int(self.position[0]), int(self.position[1])
+        radius = self.activity_check_radius
+        
+        # Get bounds
+        height, width = diff_map.shape
+        x_min = max(0, x - radius)
+        x_max = min(width, x + radius)
+        y_min = max(0, y - radius)
+        y_max = min(height, y + radius)
+        
+        # Check if there's any non-zero activity in the region
+        region = diff_map[y_min:y_max, x_min:x_max]
+        has_activity = np.any(region > 0)
+        
+        return has_activity
+    
+    def update_activity_status(self, diff_map):
+        """Update the no-activity frame counter based on diff_map."""
+        if self.check_area_activity(diff_map):
+            self.frames_with_no_activity = 0
+        else:
+            self.frames_with_no_activity += 1
+    
     def is_alive(self, current_frame, max_frames_lost=30):
-        """Check if track should be kept alive - increased lifetime for better persistence."""
+        """
+        Check if track should be kept alive.
+        Reduced lifetime and added activity-based killing.
+        """
         frames_lost = current_frame - self.last_seen_frame
         
-        # Need minimum number of updates to be considered established
-        if self.total_updates < 3:
-            return frames_lost < 10  # Increased from 5
+        # Kill immediately if no activity in area for several frames
+        if self.frames_with_no_activity >= 5:  # 5 frames of zero activity = death
+            return False
         
-        return frames_lost < max_frames_lost  # Increased from 10
+        # Reduced max frames tolerance
+        if self.total_updates < 3:
+            return frames_lost < 10  # New tracks: 10 frames (reduced from 15)
+        
+        return frames_lost < max_frames_lost  # Established tracks: 30 frames (reduced from 50)
     
     def get_speed(self):
         """Get current speed magnitude."""
@@ -147,6 +198,11 @@ class Object:
         self.position = initial_track.position.copy()
         self.velocity = initial_track.velocity.copy()
         
+        # Low-pass filter for smoothing
+        self.alpha = 0.3  # Smoothing factor (0=no change, 1=instant change)
+        self.raw_position = initial_track.position.copy()  # Unfiltered position
+        self.raw_velocity = initial_track.velocity.copy()  # Unfiltered velocity
+        
         # Track pool: stores track objects (not just IDs) for active fusion
         self.track_pool = [initial_track]  # Active tracks contributing to this object
         self.track_history = deque(maxlen=10)  # Historical track IDs
@@ -158,6 +214,9 @@ class Object:
         self.total_updates = 1
         
         self.color = tuple(np.random.randint(100, 255, 3).tolist())
+        
+        # Each object has its own importance map (initialized later with frame dimensions)
+        self.importance_map = None
     
     def predict_position(self, dt=1.0):
         """Predict next position based on velocity."""
@@ -233,19 +292,24 @@ class Object:
         total_weight = sum(weights)
         
         if total_weight > 0:
-            # Weighted average of positions
+            # Weighted average of positions (raw/unfiltered)
             weighted_positions = [track.position * weight 
                                  for (track, _), weight in zip(track_correlations, weights)]
-            self.position = sum(weighted_positions) / total_weight
+            self.raw_position = sum(weighted_positions) / total_weight
             
-            # Weighted average of velocities
+            # Weighted average of velocities (raw/unfiltered)
             weighted_velocities = [track.velocity * weight 
                                   for (track, _), weight in zip(track_correlations, weights)]
-            self.velocity = sum(weighted_velocities) / total_weight
+            self.raw_velocity = sum(weighted_velocities) / total_weight
         else:
             # Fallback to simple average
-            self.position = np.mean([t.position for t, _ in track_correlations], axis=0)
-            self.velocity = np.mean([t.velocity for t, _ in track_correlations], axis=0)
+            self.raw_position = np.mean([t.position for t, _ in track_correlations], axis=0)
+            self.raw_velocity = np.mean([t.velocity for t, _ in track_correlations], axis=0)
+        
+        # Apply low-pass filter (exponential smoothing)
+        # position = alpha * raw + (1-alpha) * previous
+        self.position = self.alpha * self.raw_position + (1 - self.alpha) * self.position
+        self.velocity = self.alpha * self.raw_velocity + (1 - self.alpha) * self.velocity
         
         self.last_seen_frame = frame_id
         self.frames_since_update = 0
@@ -260,8 +324,76 @@ class Object:
         """Get current speed magnitude."""
         return np.linalg.norm(self.velocity)
     
+    def update_importance_map(self, all_tracks, valuable_score=5.0, unimportant_score=-3.0, 
+                              use_prediction=True, prediction_steps=3):
+        """
+        Update this object's importance map based on track importance.
+        Tracks in track_pool are important (positive), others are unimportant (negative).
+        
+        Args:
+            all_tracks: All alive tracks to categorize
+            valuable_score: Positive score for important tracks
+            unimportant_score: Negative score for unimportant tracks
+            use_prediction: If True, paint predicted future positions
+            prediction_steps: Number of future frames to predict (default 3)
+        """
+        if self.importance_map is None:
+            return
+        
+        # Get track IDs in pool for quick lookup
+        pool_track_ids = {t.id for t in self.track_pool}
+        
+        # Categorize tracks
+        important_tracks = [t for t in all_tracks if t.id in pool_track_ids]
+        unimportant_tracks = [t for t in all_tracks if t.id not in pool_track_ids]
+        
+        # Update the importance map with current positions
+        self.importance_map.update(important_tracks, unimportant_tracks, 
+                                   valuable_score, unimportant_score)
+        
+        # PREDICTIVE IMPORTANCE: Paint predicted future positions for fast-moving objects
+        if use_prediction:
+            object_speed = self.get_speed()
+            
+            # Use prediction if object is moving (speed > 10 px/frame)
+            if object_speed > 10:
+                # 1. Paint predicted OBJECT position trajectory (to prediction layer)
+                for step in range(1, prediction_steps + 1):
+                    # Predict where the object will be
+                    predicted_obj_pos = self.position + self.velocity * step
+                    
+                    # Paint with gradually decreasing strength
+                    prediction_strength = valuable_score * 2.0 * (1.0 - step * 0.15)  # Strong, visible
+                    prediction_radius = 35 - step * 5  # 30, 25, 20 pixels
+                    
+                    self.importance_map.add_prediction(
+                        predicted_obj_pos,
+                        prediction_strength,
+                        radius=prediction_radius
+                    )
+                
+                # 2. Paint predicted TRACK positions (more detailed predictions to prediction layer)
+                for track in important_tracks:
+                    track_speed = track.get_speed()
+                    
+                    # Only predict for moving tracks
+                    if track_speed > 5:
+                        for step in range(1, prediction_steps + 1):
+                            # Predict position: current + velocity * time_steps
+                            predicted_track_pos = track.position + track.velocity * step
+                            
+                            # Smaller influence, more focused, but still visible
+                            track_prediction_strength = valuable_score * 1.5 * (1.0 - step * 0.2)
+                            track_prediction_radius = max(12, 25 - step * 4)  # 21, 17, 13 pixels
+                            
+                            self.importance_map.add_prediction(
+                                predicted_track_pos,
+                                track_prediction_strength,
+                                radius=track_prediction_radius
+                            )
+    
     def __repr__(self):
-        return f"Object(id={self.id}, pos={self.position}, tracks={len(self.tracks)})"
+        return f"Object(id={self.id}, pos={self.position}, tracks={len(self.track_pool)})"
 
 
 def calculate_track_object_score(track, obj, frame_id):
@@ -307,10 +439,11 @@ def calculate_track_object_score(track, obj, frame_id):
         recency_score = 2
     score += recency_score
     
-    # 4. CERTAINTY BONUS - This is the key to preventing jumps!
-    # High certainty tracks get massive bonus (up to 30 points)
-    certainty_bonus = certainty * 30
-    score += certainty_bonus
+    # 4. CERTAINTY MULTIPLIER - Scales the entire score by certainty
+    # High certainty tracks get proportionally higher total scores
+    # Instead of flat bonus, multiply base score by (1 + certainty)
+    # This gives 0-100% boost based on certainty level
+    score *= (1.0 + certainty)
     
     return score
 
@@ -517,6 +650,172 @@ def setup_blob_detector():
     return cv.SimpleBlobDetector_create(params)
 
 
+class ImportanceMap:
+    """
+    Spatial importance map with three separate layers:
+    - Positive layer (valuable tracks) - fast decay
+    - Negative layer (noise) - persistent slow decay
+    - Prediction layer (future positions) - very fast decay, always visible
+    """
+    
+    def __init__(self, width, height, positive_decay=0.85, negative_decay=0.98, prediction_decay=0.75):
+        """
+        Args:
+            width: Frame width
+            height: Frame height
+            positive_decay: Fast decay for positive scores (0.85 = 15% decay per frame)
+            negative_decay: Slow decay for negative scores (0.98 = 2% decay per frame)
+            prediction_decay: Very fast decay for predictions (0.75 = 25% decay per frame)
+        """
+        self.positive_map = np.zeros((height, width), dtype=np.float32)
+        self.negative_map = np.zeros((height, width), dtype=np.float32)
+        self.prediction_map = np.zeros((height, width), dtype=np.float32)  # NEW: separate prediction layer
+        self.positive_decay = positive_decay
+        self.negative_decay = negative_decay
+        self.prediction_decay = prediction_decay
+        self.width = width
+        self.height = height
+    
+    def add_gaussian_influence(self, center, value, radius=30):
+        """
+        Add a Gaussian-weighted influence around a point.
+        Automatically routes to positive or negative map.
+        
+        Args:
+            center: (x, y) position
+            value: Amount to add (positive for good, negative for bad)
+            radius: Radius of influence in pixels
+        """
+        x, y = int(center[0]), int(center[1])
+        
+        # Create coordinate grids
+        y_grid, x_grid = np.ogrid[-radius:radius+1, -radius:radius+1]
+        
+        # Gaussian formula: exp(-(x^2 + y^2) / (2 * sigma^2))
+        sigma = radius / 3.0  # 3-sigma rule
+        gaussian = np.exp(-(x_grid**2 + y_grid**2) / (2 * sigma**2))
+        
+        # Calculate the region bounds
+        x_min = max(0, x - radius)
+        x_max = min(self.width, x + radius + 1)
+        y_min = max(0, y - radius)
+        y_max = min(self.height, y + radius + 1)
+        
+        # Calculate corresponding gaussian region
+        g_x_min = max(0, radius - x)
+        g_x_max = g_x_min + (x_max - x_min)
+        g_y_min = max(0, radius - y)
+        g_y_max = g_y_min + (y_max - y_min)
+        
+        influence = gaussian[g_y_min:g_y_max, g_x_min:g_x_max] * value
+        
+        # Route to appropriate map
+        if value > 0:
+            # Positive: add to positive map
+            self.positive_map[y_min:y_max, x_min:x_max] += influence
+        else:
+            # Negative: add to negative map (store as positive values)
+            # Only add negative if not already very negative (prevent stacking)
+            region = self.negative_map[y_min:y_max, x_min:x_max]
+            self.negative_map[y_min:y_max, x_min:x_max] = np.maximum(region, -influence)
+    
+    def update(self, valuable_tracks, noise_tracks, valuable_score=5.0, noise_score=-3.0):
+        """
+        Update importance map based on current tracks.
+        
+        Args:
+            valuable_tracks: List of tracks being used by objects
+            noise_tracks: List of tracks not being used (noise)
+            valuable_score: Positive value to add around good tracks
+            noise_score: Negative value to add around bad tracks
+        """
+        # Apply different decay rates
+        self.positive_map *= self.positive_decay  # Fast decay (15% per frame)
+        self.negative_map *= self.negative_decay  # Slow decay (2% per frame)
+        self.prediction_map *= self.prediction_decay  # Very fast decay (25% per frame)
+        
+        # Add positive influence around valuable tracks
+        for track in valuable_tracks:
+            self.add_gaussian_influence(track.position, valuable_score, radius=30)
+        
+        # Add negative influence around noise tracks
+        for track in noise_tracks:
+            self.add_gaussian_influence(track.position, noise_score, radius=25)
+    
+    def add_prediction(self, center, value, radius=20):
+        """
+        Add prediction influence to the separate prediction layer.
+        This layer decays very fast to create visible corridors.
+        
+        Args:
+            center: (x, y) predicted position
+            value: Importance value (typically positive)
+            radius: Radius of influence
+        """
+        x, y = int(center[0]), int(center[1])
+        
+        # Create coordinate grids
+        y_grid, x_grid = np.ogrid[-radius:radius+1, -radius:radius+1]
+        
+        # Gaussian formula
+        sigma = radius / 3.0
+        gaussian = np.exp(-(x_grid**2 + y_grid**2) / (2 * sigma**2))
+        
+        # Calculate bounds
+        x_min = max(0, x - radius)
+        x_max = min(self.width, x + radius + 1)
+        y_min = max(0, y - radius)
+        y_max = min(self.height, y + radius + 1)
+        
+        # Calculate corresponding gaussian region
+        g_x_min = max(0, radius - x)
+        g_x_max = g_x_min + (x_max - x_min)
+        g_y_min = max(0, radius - y)
+        g_y_max = g_y_min + (y_max - y_min)
+        
+        # Add to prediction layer only
+        influence = gaussian[g_y_min:g_y_max, g_x_min:g_x_max] * value
+        self.prediction_map[y_min:y_max, x_min:x_max] += influence
+    
+    def get_score(self, position):
+        """Get combined importance score at a position."""
+        x, y = int(position[0]), int(position[1])
+        if 0 <= x < self.width and 0 <= y < self.height:
+            # Combine all three layers
+            positive_val = self.positive_map[y, x]
+            negative_val = self.negative_map[y, x]
+            prediction_val = self.prediction_map[y, x]
+            
+            # Combined score: positive + prediction - negative
+            return positive_val + prediction_val - negative_val
+        return 0.0
+    
+    def get_visualization(self):
+        """Get visualization of the combined importance map."""
+        # Combine all three layers
+        combined = self.positive_map + self.prediction_map - self.negative_map
+        
+        # Clip extreme values for better visualization
+        combined = np.clip(combined, -20, 20)
+        
+        # Normalize to 0-255
+        map_min = combined.min()
+        map_max = combined.max()
+        if map_max > map_min:
+            map_vis = ((combined - map_min) / (map_max - map_min) * 255).astype(np.uint8)
+        else:
+            map_vis = np.zeros_like(combined, dtype=np.uint8)
+        
+        # Apply colormap (blue=negative, green=neutral, red=positive)
+        return cv.applyColorMap(map_vis, cv.COLORMAP_JET)
+    
+    def reset(self):
+        """Reset all three maps to zeros."""
+        self.positive_map.fill(0)
+        self.negative_map.fill(0)
+        self.prediction_map.fill(0)
+
+
 def main():
     camera_index = 0
     cap = cv.VideoCapture(camera_index)
@@ -539,7 +838,10 @@ def main():
     print("  'b' - Toggle blob detection overlay")
     print("  't' - Toggle track visualization")
     print("  'o' - Toggle object visualization")
+    print("  'i' - Toggle importance map visualization")
+    print("  'p' - Toggle predictive importance mapping")
     print("  '1-9' - Set number of objects in scene")
+    print("  '+/-' - Increase/decrease prediction steps")
     print()
     
     prev_gray = None
@@ -547,6 +849,9 @@ def main():
     show_debug = True
     show_blobs = True
     show_tracks = True
+    show_importance = False  # Toggle for importance map visualization
+    use_prediction = True  # Toggle for predictive importance
+    prediction_steps = 3  # Number of future frames to predict
     frame_count = 0
     saved_count = 0
     max_objects = MAX_OBJECTS
@@ -619,6 +924,10 @@ def main():
                 if track.id in track_assignments:
                     track.update(track_assignments[track.id], frame_count)
             
+            # Update activity status for all tracks based on diff_map
+            for track in tracks:
+                track.update_activity_status(diff_map)
+            
             # Add unmatched blobs to history
             unmatched_history.append(unmatched_blobs)
             
@@ -645,6 +954,9 @@ def main():
             # Remove dead tracks
             alive_tracks = [t for t in tracks if t.is_alive(frame_count)]
             
+            # Initialize valuable_track_ids as empty
+            valuable_track_ids = set()
+            
             # === OBJECT LEVEL TRACKING (Fixed number of objects) ===
             # Initialize objects if needed (first tracks appear)
             if len(objects) < max_objects and len(alive_tracks) > 0:
@@ -662,6 +974,13 @@ def main():
                     
                     if not too_close:
                         new_object = Object(track, frame_count)
+                        # Initialize object's importance map with frame dimensions
+                        height, width = gray.shape
+                        # Fast decay for positive (85%), slow for negative (98%), very fast for predictions (75%)
+                        new_object.importance_map = ImportanceMap(width, height, 
+                                                                   positive_decay=0.85, 
+                                                                   negative_decay=0.98,
+                                                                   prediction_decay=0.75)
                         objects.append(new_object)
                         print(f"Initialized object #{new_object.id} at pos {track.position}")
             
@@ -680,11 +999,18 @@ def main():
                         # Object had no matching tracks this frame
                         obj.update([], frame_count)
                 
-                # Categorize tracks: valuable = in any object's track pool
-                valuable_track_ids = set()
+                # Update categorization: valuable = in any object's track pool
+                valuable_track_ids.clear()
                 for obj in objects:
                     # Include all tracks actively contributing to this object
                     valuable_track_ids.update([t.id for t in obj.track_pool])
+                    
+                    # Update this object's importance map with prediction
+                    obj.update_importance_map(alive_tracks, 
+                                             valuable_score=5.0, 
+                                             unimportant_score=-3.0,
+                                             use_prediction=use_prediction,
+                                             prediction_steps=prediction_steps)
             
             # Objects never get removed - they represent the fixed scene entities
             
@@ -709,6 +1035,14 @@ def main():
             
             # Draw tracks if enabled (with categorization and certainty)
             if show_tracks and tracks:
+                # Pre-calculate track scores for their assigned objects
+                track_scores = {}
+                if objects:
+                    for obj in objects:
+                        for track in obj.track_pool:
+                            score = calculate_track_object_score(track, obj, frame_count)
+                            track_scores[track.id] = score
+                
                 for track in tracks:
                     # Check if track is valuable (assigned to an object) or noise
                     is_valuable = track.id in valuable_track_ids if 'valuable_track_ids' in locals() else False
@@ -716,15 +1050,19 @@ def main():
                     # Get certainty for visual feedback
                     certainty = track.get_certainty()
                     
-                    # Color: blend based on certainty (red=uncertain, green=certain)
+                    # Get score if track is assigned to an object
+                    track_score = track_scores.get(track.id, 0) if is_valuable else 0
+                    
+                    # Color: GREEN only if valuable (in object), otherwise GRAY
                     if is_valuable:
-                        # Valuable tracks: color intensity based on certainty
-                        color_scale = int(certainty * 255)
-                        track_color = (track.color[0] * certainty, track.color[1] * certainty, track.color[2] * certainty)
-                        track_color = tuple(map(int, track_color))
+                        # Pure green for valuable tracks
+                        ring_color = (0, 255, 0)
                     else:
-                        # Noise tracks: gray
-                        track_color = (100, 100, 100)
+                        # Gray for noise tracks
+                        ring_color = (100, 100, 100)
+                    
+                    # Use original track color for center dot
+                    track_color = track.color if is_valuable else (80, 80, 80)
                     
                     # Draw track history trail (thickness based on certainty)
                     if len(track.position_history) > 1:
@@ -734,14 +1072,22 @@ def main():
                         for i in range(len(points) - 1):
                             cv.line(vis_frame, points[i], points[i + 1], track_color, line_thickness)
                     
-                    # Draw current position (size based on certainty)
+                    # Draw current position (fixed small size)
                     pos = tuple(map(int, track.position))
-                    circle_size = int(4 + certainty * 6) if is_valuable else 3
+                    circle_size = 4 if is_valuable else 3
                     cv.circle(vis_frame, pos, circle_size, track_color, -1)
                     
-                    # Outer ring color indicates certainty level
-                    ring_color = (0, int(certainty * 255), int((1-certainty) * 255)) if is_valuable else (100, 100, 100)
-                    cv.circle(vis_frame, pos, circle_size + 2, ring_color, 2 if is_valuable else 1)
+                    # Outer ring: size based on SCORE, thickness based on CERTAINTY, color based on valuable/noise
+                    if is_valuable:
+                        # Ring radius scales with score (normalized to 0-100 range, giving 2-12 pixel ring)
+                        normalized_score = min(track_score / 100.0, 1.0)  # Normalize assuming max ~100
+                        ring_radius = circle_size + int(2 + normalized_score * 10)
+                        ring_thickness = max(1, int(certainty * 3))
+                    else:
+                        ring_radius = circle_size + 2
+                        ring_thickness = 1
+                    
+                    cv.circle(vis_frame, pos, ring_radius, ring_color, ring_thickness)
                     
                     # Draw velocity vector if significant (only for valuable tracks)
                     if is_valuable:
@@ -799,6 +1145,71 @@ def main():
                 overlay = cv.addWeighted(frame, 0.3, colored_diff, 0.7, 0)
                 cv.imshow("Overlay", overlay)
             
+            # Importance map visualization (show combined map of all objects)
+            if show_importance and objects:
+                # Create combined maps from all objects (three layers)
+                height, width = gray.shape
+                combined_positive = np.zeros((height, width), dtype=np.float32)
+                combined_negative = np.zeros((height, width), dtype=np.float32)
+                combined_prediction = np.zeros((height, width), dtype=np.float32)
+                
+                for obj in objects:
+                    if obj.importance_map:
+                        combined_positive += obj.importance_map.positive_map
+                        combined_negative += obj.importance_map.negative_map
+                        combined_prediction += obj.importance_map.prediction_map
+                
+                # Create full combined view (positive + prediction - negative)
+                full_combined = combined_positive + combined_prediction - combined_negative
+                combined_vis = np.clip(full_combined, -20, 20)
+                map_min = combined_vis.min()
+                map_max = combined_vis.max()
+                if map_max > map_min:
+                    combined_vis = ((combined_vis - map_min) / (map_max - map_min) * 255).astype(np.uint8)
+                else:
+                    combined_vis = np.zeros_like(combined_vis, dtype=np.uint8)
+                
+                importance_colored = cv.applyColorMap(combined_vis, cv.COLORMAP_JET)
+                importance_overlay = cv.addWeighted(frame, 0.4, importance_colored, 0.6, 0)
+                
+                label_text = f"Combined Importance ({len(objects)} objects)"
+                cv.putText(importance_overlay, label_text, 
+                          (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                cv.imshow("Combined Importance Map", importance_overlay)
+                
+                # Show PREDICTION layer separately if prediction is enabled
+                if use_prediction and np.max(combined_prediction) > 0.1:
+                    pred_vis = np.clip(combined_prediction, 0, 20)
+                    if pred_vis.max() > 0:
+                        pred_vis = (pred_vis / pred_vis.max() * 255).astype(np.uint8)
+                    else:
+                        pred_vis = np.zeros_like(pred_vis, dtype=np.uint8)
+                    
+                    # Use HOT colormap for predictions (black -> red -> yellow -> white)
+                    pred_colored = cv.applyColorMap(pred_vis, cv.COLORMAP_HOT)
+                    pred_overlay = cv.addWeighted(frame, 0.5, pred_colored, 0.5, 0)
+                    
+                    cv.putText(pred_overlay, f"Prediction Corridors ({prediction_steps} steps)", 
+                              (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    cv.putText(pred_overlay, "Red/Yellow = Predicted positions", 
+                              (10, 60), cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                    
+                    cv.imshow("Prediction Corridors", pred_overlay)
+                else:
+                    try:
+                        cv.destroyWindow("Prediction Corridors")
+                    except:
+                        pass
+                    
+            elif not show_importance:
+                # Close importance map windows if toggled off
+                try:
+                    cv.destroyWindow("Combined Importance Map")
+                    cv.destroyWindow("Prediction Corridors")
+                except:
+                    pass
+            
             # Statistics
             mean_diff = np.mean(diff_map)
             max_diff = np.max(diff_map)
@@ -824,6 +1235,10 @@ def main():
             cv.putText(vis_frame, f"Tracks: {'ON' if show_tracks else 'OFF'} (t)", (10, 210), 
                       cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             cv.putText(vis_frame, f"Objects: {'ON' if show_objects else 'OFF'} (o)", (10, 240), 
+                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            cv.putText(vis_frame, f"Importance: {'ON' if show_importance else 'OFF'} (i)", (10, 270), 
+                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            cv.putText(vis_frame, f"Prediction: {'ON' if use_prediction else 'OFF'} (p) Steps: {prediction_steps} (+/-)", (10, 300), 
                       cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             
             cv.imshow("Frame with Blobs", vis_frame)
@@ -862,6 +1277,18 @@ def main():
         elif key == ord('o'):
             show_objects = not show_objects
             print(f"Object visualization: {'ON' if show_objects else 'OFF'}")
+        elif key == ord('i'):
+            show_importance = not show_importance
+            print(f"Importance map: {'ON' if show_importance else 'OFF'}")
+        elif key == ord('p'):
+            use_prediction = not use_prediction
+            print(f"Predictive importance: {'ON' if use_prediction else 'OFF'}")
+        elif key == ord('+') or key == ord('='):
+            prediction_steps = min(10, prediction_steps + 1)
+            print(f"Prediction steps: {prediction_steps}")
+        elif key == ord('-') or key == ord('_'):
+            prediction_steps = max(1, prediction_steps - 1)
+            print(f"Prediction steps: {prediction_steps}")
         elif key >= ord('1') and key <= ord('9'):
             # Change max number of objects in scene
             new_max = key - ord('0')
@@ -874,13 +1301,17 @@ def main():
         elif key == ord('c'):
             prev_gray = None
             tracks.clear()
-            objects.clear()
             prev_blobs = []
             unmatched_history.clear()
             unmatched_tracks_history.clear()
             Track.next_id = 0
+            # Reset all object importance maps before clearing
+            for obj in objects:
+                if obj.importance_map:
+                    obj.importance_map.reset()
+            objects.clear()
             Object.next_id = 0
-            print("Reset - cleared previous frame, all tracks and objects")
+            print("Reset - cleared previous frame, all tracks, objects, and importance maps")
     
     cap.release()
     cv.destroyAllWindows()
