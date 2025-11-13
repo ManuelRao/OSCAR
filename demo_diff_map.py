@@ -816,531 +816,533 @@ class ImportanceMap:
         self.prediction_map.fill(0)
 
 
-def main():
-    camera_index = 0
-    cap = cv.VideoCapture(camera_index)
-    
-    if not cap.isOpened():
-        print(f"ERROR: Cannot open camera {camera_index}")
-        return
-    
-    print(f"Camera {camera_index} opened successfully!")
-    
-    # Scene configuration
-    MAX_OBJECTS = 2  # Fixed number of objects in the scene
-    print(f"\nScene Configuration: {MAX_OBJECTS} objects")
-    
-    print("\nControls:")
-    print("  'q' - Quit")
-    print("  's' - Save current diff_map")
-    print("  'd' - Toggle debug views")
-    print("  'c' - Clear/reset")
-    print("  'b' - Toggle blob detection overlay")
-    print("  't' - Toggle track visualization")
-    print("  'o' - Toggle object visualization")
-    print("  'i' - Toggle importance map visualization")
-    print("  'p' - Toggle predictive importance mapping")
-    print("  '1-9' - Set number of objects in scene")
-    print("  '+/-' - Increase/decrease prediction steps")
-    print()
-    
-    prev_gray = None
-    prev_blobs = []
-    show_debug = True
-    show_blobs = True
-    show_tracks = True
-    show_importance = False  # Toggle for importance map visualization
-    use_prediction = True  # Toggle for predictive importance
-    prediction_steps = 3  # Number of future frames to predict
-    frame_count = 0
-    saved_count = 0
-    max_objects = MAX_OBJECTS
-    
-    # Setup blob detector
-    blob_detector = setup_blob_detector()
-    
-    # Track management
-    tracks = []
-    unmatched_history = deque(maxlen=5)
-    last_frame_time = time.time()
-    
-    # Object management (higher level grouping of tracks)
-    objects = []
-    unmatched_tracks_history = deque(maxlen=3)
-    show_objects = True
-    
-    # Temporal smoothing for diff_map to reduce jumpiness
-    accumulated_diff = None
-    diff_alpha = 0.9  # Blending factor for temporal smoothing
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Failed to read frame")
-            break
-        
-        frame_count += 1
-        gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-        
-        if prev_gray is not None:
-            # Calculate difference map
-            diff_map = mf.picture_diference(gray, prev_gray)
-            
-            # Process diff_map: normalize first
-            diff_map = cv.normalize(diff_map, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
-            
-            # Apply temporal smoothing to reduce jumpiness from lighting/camera changes
-            if accumulated_diff is None:
-                accumulated_diff = diff_map.astype(np.float32)
-            else:
-                # Blend current diff with accumulated: new = alpha*current + (1-alpha)*previous
-                accumulated_diff = diff_alpha * diff_map.astype(np.float32) + (1 - diff_alpha) * accumulated_diff
-            
-            # Use the smoothed diff map
-            diff_map_smoothed = accumulated_diff.astype(np.uint8)
-            
-            # Lighter blur to preserve detail
-            diff_map_smoothed = cv.GaussianBlur(diff_map_smoothed, (5, 5), 2)
-            
-            # Lower threshold to capture more subtle changes
-            diff_map_final = cv.threshold(diff_map_smoothed, 20, 255, cv.THRESH_BINARY)[1]
-            
-            # Detect blobs in the thresholded diff_map
-            keypoints = blob_detector.detect(diff_map_final)
-            
-            # Convert keypoints to BlobInfo objects with velocity calculation
-            current_time = time.time()
-            dt = current_time - last_frame_time
-            last_frame_time = current_time
-            
-            blobs = []
-            for kp in keypoints:
-                blob = BlobInfo(kp, frame_count)
-                
-                # Calculate velocity by finding closest previous blob
-                if prev_blobs:
-                    closest_dist = float('inf')
-                    closest_blob = None
-                    for prev_blob in prev_blobs:
-                        dist = np.linalg.norm(blob.pos - prev_blob.pos)
-                        if dist < closest_dist:
-                            closest_dist = dist
-                            closest_blob = prev_blob
-                    
-                    # Only calculate velocity if close enough (< 50 pixels)
-                    if closest_blob and closest_dist < 50:
-                        if dt > 0:
-                            blob.velocity = (blob.pos - closest_blob.pos) / dt
-                
-                blobs.append(blob)
-            
-            # Match blobs to existing tracks
-            track_assignments, unmatched_blobs = match_blobs_to_tracks(blobs, tracks, frame_count)
-            
-            # Update tracks with matched blobs
-            for track in tracks:
-                if track.id in track_assignments:
-                    track.update(track_assignments[track.id], frame_count)
-            
-            # Update activity status for all tracks based on final diff_map
-            for track in tracks:
-                track.update_activity_status(diff_map_final)
-            
-            # Add unmatched blobs to history
-            unmatched_history.append(unmatched_blobs)
-            
-            # Find persistent unmatched blobs that should become new tracks
-            # Keep permissive - tracks are like measurements, we'll filter later
-            persistent_blobs = find_persistent_blobs(unmatched_blobs, unmatched_history, 
-                                                     min_persistence=3, max_distance=50)
-            
-            # Create new tracks for persistent blobs
-            for persistent_blob in persistent_blobs:
-                # Don't create track if it's extremely close to existing one
-                too_close_to_existing = False
-                for existing_track in tracks:
-                    dist = np.linalg.norm(persistent_blob.pos - existing_track.position)
-                    if dist < 30:  # Only reject if very close
-                        too_close_to_existing = True
-                        break
-                
-                if not too_close_to_existing:
-                    new_track = Track(persistent_blob, frame_count)
-                    tracks.append(new_track)
-                    print(f"Created new track #{new_track.id}")
-            
-            # Remove dead tracks
-            alive_tracks = [t for t in tracks if t.is_alive(frame_count)]
-            
-            # Initialize valuable_track_ids as empty
-            valuable_track_ids = set()
-            
-            # === OBJECT LEVEL TRACKING (Fixed number of objects) ===
-            # Initialize objects if needed (first tracks appear)
-            if len(objects) < max_objects and len(alive_tracks) > 0:
-                # Create objects from first tracks seen
-                for track in alive_tracks:
-                    if len(objects) >= max_objects:
-                        break
-                    
-                    # Check if this track is far from existing objects
-                    too_close = False
-                    for obj in objects:
-                        if np.linalg.norm(track.position - obj.position) < 100:
-                            too_close = True
-                            break
-                    
-                    if not too_close:
-                        new_object = Object(track, frame_count)
-                        # Initialize object's importance map with frame dimensions
-                        height, width = gray.shape
-                        # Fast decay for positive (85%), slow for negative (98%), very fast for predictions (75%)
-                        new_object.importance_map = ImportanceMap(width, height, 
-                                                                   positive_decay=0.85, 
-                                                                   negative_decay=0.98,
-                                                                   prediction_decay=0.75)
-                        objects.append(new_object)
-                        print(f"Initialized object #{new_object.id} at pos {track.position}")
-            
-            # Match all tracks to the fixed set of objects
-            if alive_tracks and objects:
-                object_assignments, unmatched_tracks = match_tracks_to_objects(
-                    alive_tracks, objects, frame_count, min_score=20
-                )
-                
-                # Update objects with matched tracks (multi-track fusion)
-                for obj in objects:
-                    if obj.id in object_assignments and object_assignments[obj.id]:
-                        # Pass all candidate tracks to object for correlation-based fusion
-                        obj.update(object_assignments[obj.id], frame_count, correlation_threshold=0.35)
-                    else:
-                        # Object had no matching tracks this frame
-                        obj.update([], frame_count)
-                
-                # Update categorization: valuable = in any object's track pool
-                valuable_track_ids.clear()
-                for obj in objects:
-                    # Include all tracks actively contributing to this object
-                    valuable_track_ids.update([t.id for t in obj.track_pool])
-                    
-                    # Update this object's importance map with prediction
-                    obj.update_importance_map(alive_tracks, 
-                                             valuable_score=5.0, 
-                                             unimportant_score=-3.0,
-                                             use_prediction=use_prediction,
-                                             prediction_steps=prediction_steps)
-            
-            # Objects never get removed - they represent the fixed scene entities
-            
-            tracks = alive_tracks
-            
-            # Store blobs for next frame
-            prev_blobs = blobs
-            
-            # Display smoothed diff_map (final processed version)
-            cv.imshow("Diff Map", diff_map_final)
-            
-            # Create visualization frame
-            vis_frame = frame.copy()
-            
-            # Draw blobs if enabled
-            if show_blobs and keypoints:
-                for kp in keypoints:
-                    x, y = int(kp.pt[0]), int(kp.pt[1])
-                    size = int(kp.size)
-                    cv.circle(vis_frame, (x, y), size, (0, 255, 0), 2)
-                    cv.circle(vis_frame, (x, y), 3, (0, 0, 255), -1)
-            
-            # Draw tracks if enabled (with categorization and certainty)
-            if show_tracks and tracks:
-                # Pre-calculate track scores for their assigned objects
-                track_scores = {}
-                if objects:
-                    for obj in objects:
-                        for track in obj.track_pool:
-                            score = calculate_track_object_score(track, obj, frame_count)
-                            track_scores[track.id] = score
-                
-                for track in tracks:
-                    # Check if track is valuable (assigned to an object) or noise
-                    is_valuable = track.id in valuable_track_ids if 'valuable_track_ids' in locals() else False
-                    
-                    # Get certainty for visual feedback
-                    certainty = track.get_certainty()
-                    
-                    # Get score if track is assigned to an object
-                    track_score = track_scores.get(track.id, 0) if is_valuable else 0
-                    
-                    # Color: GREEN only if valuable (in object), otherwise GRAY
-                    if is_valuable:
-                        # Pure green for valuable tracks
-                        ring_color = (0, 255, 0)
-                    else:
-                        # Gray for noise tracks
-                        ring_color = (100, 100, 100)
-                    
-                    # Use original track color for center dot
-                    track_color = track.color if is_valuable else (80, 80, 80)
-                    
-                    # Draw track history trail (thickness based on certainty)
-                    if len(track.position_history) > 1:
-                        # position_history stores (pos, frame_id) tuples
-                        points = [tuple(map(int, pos_frame[0])) for pos_frame in track.position_history]
-                        line_thickness = max(1, int(certainty * 3)) if is_valuable else 1
-                        for i in range(len(points) - 1):
-                            cv.line(vis_frame, points[i], points[i + 1], track_color, line_thickness)
-                    
-                    # Draw current position (fixed small size)
-                    pos = tuple(map(int, track.position))
-                    circle_size = 4 if is_valuable else 3
-                    cv.circle(vis_frame, pos, circle_size, track_color, -1)
-                    
-                    # Outer ring: size based on SCORE, thickness based on CERTAINTY, color based on valuable/noise
-                    if is_valuable:
-                        # Ring radius scales with score (normalized to 0-100 range, giving 2-12 pixel ring)
-                        normalized_score = min(track_score / 100.0, 1.0)  # Normalize assuming max ~100
-                        ring_radius = circle_size + int(2 + normalized_score * 10)
-                        ring_thickness = max(1, int(certainty * 3))
-                    else:
-                        ring_radius = circle_size + 2
-                        ring_thickness = 1
-                    
-                    cv.circle(vis_frame, pos, ring_radius, ring_color, ring_thickness)
-                    
-                    # Draw velocity vector if significant (only for valuable tracks)
-                    if is_valuable:
-                        speed = track.get_speed()
-                        if speed > 5:  # Only draw if moving
-                            end_pos = tuple(map(int, track.position + track.velocity * 0.3))
-                            cv.arrowedLine(vis_frame, pos, end_pos, track_color, 2, tipLength=0.3)
-                    
-                    # Draw track ID (smaller for noise)
-                    font_scale = 0.5 if is_valuable else 0.3
-                    cv.putText(vis_frame, f"#{track.id}", 
-                              (pos[0] + 15, pos[1] - 10),
-                              cv.FONT_HERSHEY_SIMPLEX, font_scale, track_color, 2 if is_valuable else 1)
-            
-            # Draw objects if enabled (multi-track fusion visualization)
-            if show_objects and objects:
-                for obj in objects:
-                    # Draw lines connecting object to its active track pool
-                    obj_pos = tuple(map(int, obj.position))
-                    for track in obj.track_pool:
-                        track_pos = tuple(map(int, track.position))
-                        # Line thickness based on track certainty
-                        certainty = track.get_certainty()
-                        correlation = obj.calculate_track_correlation(track)
-                        line_thickness = max(1, int(correlation * certainty * 3))
-                        cv.line(vis_frame, obj_pos, track_pos, obj.color, line_thickness)
-                    
-                    # Draw large circle representing the fused object position
-                    cv.circle(vis_frame, obj_pos, 35, obj.color, 4)
-                    
-                    # Draw velocity vector
-                    speed = obj.get_speed()
-                    if speed > 3:
-                        end_pos = tuple(map(int, obj.position + obj.velocity * 0.5))
-                        cv.arrowedLine(vis_frame, obj_pos, end_pos, obj.color, 4, tipLength=0.3)
-                    
-                    # Draw object ID and active track pool size
-                    active_tracks = len(obj.track_pool)
-                    cv.putText(vis_frame, f"OBJ #{obj.id} [{active_tracks} tracks]", 
-                              (obj_pos[0] - 50, obj_pos[1] - 45),
-                              cv.FONT_HERSHEY_SIMPLEX, 0.7, obj.color, 2)
-                    
-                    # Show track IDs in pool (for debugging)
-                    if active_tracks > 0:
-                        track_ids = ",".join([f"#{t.id}" for t in obj.track_pool[:5]])  # Show first 5
-                        cv.putText(vis_frame, track_ids, 
-                                  (obj_pos[0] - 50, obj_pos[1] + 50),
-                                  cv.FONT_HERSHEY_SIMPLEX, 0.4, obj.color, 1)
-            
-            # Debug views
-            if show_debug:
-                colored_diff = cv.applyColorMap(diff_map_final, cv.COLORMAP_JET)
-                cv.imshow("Diff Map (Colored)", colored_diff)
-                
-                overlay = cv.addWeighted(frame, 0.3, colored_diff, 0.7, 0)
-                cv.imshow("Overlay", overlay)
-            
-            # Importance map visualization (show combined map of all objects)
-            if show_importance and objects:
-                # Create combined maps from all objects (three layers)
-                height, width = gray.shape
-                combined_positive = np.zeros((height, width), dtype=np.float32)
-                combined_negative = np.zeros((height, width), dtype=np.float32)
-                combined_prediction = np.zeros((height, width), dtype=np.float32)
-                
-                for obj in objects:
-                    if obj.importance_map:
-                        combined_positive += obj.importance_map.positive_map
-                        combined_negative += obj.importance_map.negative_map
-                        combined_prediction += obj.importance_map.prediction_map
-                
-                # Create full combined view (positive + prediction - negative)
-                full_combined = combined_positive + combined_prediction - combined_negative
-                combined_vis = np.clip(full_combined, -20, 20)
-                map_min = combined_vis.min()
-                map_max = combined_vis.max()
-                if map_max > map_min:
-                    combined_vis = ((combined_vis - map_min) / (map_max - map_min) * 255).astype(np.uint8)
-                else:
-                    combined_vis = np.zeros_like(combined_vis, dtype=np.uint8)
-                
-                importance_colored = cv.applyColorMap(combined_vis, cv.COLORMAP_JET)
-                importance_overlay = cv.addWeighted(frame, 0.4, importance_colored, 0.6, 0)
-                
-                label_text = f"Combined Importance ({len(objects)} objects)"
-                cv.putText(importance_overlay, label_text, 
-                          (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                
-                cv.imshow("Combined Importance Map", importance_overlay)
-                
-                # Show PREDICTION layer separately if prediction is enabled
-                if use_prediction and np.max(combined_prediction) > 0.1:
-                    pred_vis = np.clip(combined_prediction, 0, 20)
-                    if pred_vis.max() > 0:
-                        pred_vis = (pred_vis / pred_vis.max() * 255).astype(np.uint8)
-                    else:
-                        pred_vis = np.zeros_like(pred_vis, dtype=np.uint8)
-                    
-                    # Use HOT colormap for predictions (black -> red -> yellow -> white)
-                    pred_colored = cv.applyColorMap(pred_vis, cv.COLORMAP_HOT)
-                    pred_overlay = cv.addWeighted(frame, 0.5, pred_colored, 0.5, 0)
-                    
-                    cv.putText(pred_overlay, f"Prediction Corridors ({prediction_steps} steps)", 
-                              (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                    cv.putText(pred_overlay, "Red/Yellow = Predicted positions", 
-                              (10, 60), cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                    
-                    cv.imshow("Prediction Corridors", pred_overlay)
-                else:
-                    try:
-                        cv.destroyWindow("Prediction Corridors")
-                    except:
-                        pass
-                    
-            elif not show_importance:
-                # Close importance map windows if toggled off
-                try:
-                    cv.destroyWindow("Combined Importance Map")
-                    cv.destroyWindow("Prediction Corridors")
-                except:
-                    pass
-            
-            # Statistics
-            mean_diff = np.mean(diff_map_final)
-            max_diff = np.max(diff_map_final)
-            num_blobs = len(keypoints)
-            
-            # Info text
-            cv.putText(vis_frame, f"Frame: {frame_count}", (10, 30), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv.putText(vis_frame, f"Blobs: {num_blobs}", (10, 60), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            # Count valuable vs noise tracks
-            num_valuable = len(valuable_track_ids) if 'valuable_track_ids' in locals() else 0
-            num_noise = len(tracks) - num_valuable
-            
-            cv.putText(vis_frame, f"Tracks: {len(tracks)} ({num_valuable} valuable, {num_noise} noise)", (10, 90), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            cv.putText(vis_frame, f"Objects: {len(objects)}/{max_objects}", (10, 120), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv.putText(vis_frame, f"Mean: {mean_diff:.1f} Max: {max_diff:.1f}", (10, 150), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv.putText(vis_frame, f"Blobs: {'ON' if show_blobs else 'OFF'} (b)", (10, 180), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-            cv.putText(vis_frame, f"Tracks: {'ON' if show_tracks else 'OFF'} (t)", (10, 210), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-            cv.putText(vis_frame, f"Objects: {'ON' if show_objects else 'OFF'} (o)", (10, 240), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-            cv.putText(vis_frame, f"Importance: {'ON' if show_importance else 'OFF'} (i)", (10, 270), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-            cv.putText(vis_frame, f"Prediction: {'ON' if use_prediction else 'OFF'} (p) Steps: {prediction_steps} (+/-)", (10, 300), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-            
-            cv.imshow("Frame with Blobs", vis_frame)
-        else:
-            # First frame
-            cv.putText(frame, "Capturing first frame...", (10, 30), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            cv.imshow("Frame with Blobs", frame)
-        
-        prev_gray = gray.copy()
-        
-        # Keyboard input
-        key = cv.waitKey(1) & 0xFF
-        
-        if key == ord('q'):
-            print("Quitting...")
-            break
-        elif key == ord('s'):
-            if 'diff_map_final' in locals():
-                filename = f"diff_map_{saved_count:03d}.png"
-                cv.imwrite(filename, diff_map_final)
-                print(f"Saved: {filename}")
-                saved_count += 1
-        elif key == ord('d'):
-            show_debug = not show_debug
-            print(f"Debug views: {'ON' if show_debug else 'OFF'}")
-            if not show_debug:
-                cv.destroyWindow("Diff Map (Colored)")
-                cv.destroyWindow("Overlay")
-        elif key == ord('b'):
-            show_blobs = not show_blobs
-            print(f"Blob detection: {'ON' if show_blobs else 'OFF'}")
-        elif key == ord('t'):
-            show_tracks = not show_tracks
-            print(f"Track visualization: {'ON' if show_tracks else 'OFF'}")
-        elif key == ord('o'):
-            show_objects = not show_objects
-            print(f"Object visualization: {'ON' if show_objects else 'OFF'}")
-        elif key == ord('i'):
-            show_importance = not show_importance
-            print(f"Importance map: {'ON' if show_importance else 'OFF'}")
-        elif key == ord('p'):
-            use_prediction = not use_prediction
-            print(f"Predictive importance: {'ON' if use_prediction else 'OFF'}")
-        elif key == ord('+') or key == ord('='):
-            prediction_steps = min(10, prediction_steps + 1)
-            print(f"Prediction steps: {prediction_steps}")
-        elif key == ord('-') or key == ord('_'):
-            prediction_steps = max(1, prediction_steps - 1)
-            print(f"Prediction steps: {prediction_steps}")
-        elif key >= ord('1') and key <= ord('9'):
-            # Change max number of objects in scene
-            new_max = key - ord('0')
-            if new_max != max_objects:
-                max_objects = new_max
-                # Remove excess objects if reducing
-                if len(objects) > max_objects:
-                    objects = objects[:max_objects]
-                print(f"Max objects set to: {max_objects}")
-        elif key == ord('c'):
-            prev_gray = None
-            tracks.clear()
-            prev_blobs = []
-            unmatched_history.clear()
-            unmatched_tracks_history.clear()
-            accumulated_diff = None  # Reset temporal smoothing
-            Track.next_id = 0
-            # Reset all object importance maps before clearing
-            for obj in objects:
-                if obj.importance_map:
-                    obj.importance_map.reset()
-            objects.clear()
-            Object.next_id = 0
-            print("Reset - cleared previous frame, all tracks, objects, importance maps, and temporal buffer")
-    
-    cap.release()
-    cv.destroyAllWindows()
-    print(f"\nProcessed {frame_count} frames")
-    print(f"Saved {saved_count} diff_maps")
-    print(f"Total tracks created: {Track.next_id}")
-    print(f"Total objects created: {Object.next_id}")
 
 
 if __name__ == "__main__":
+
+    def main():
+        camera_index = 0
+        cap = cv.VideoCapture(camera_index)
+        
+        if not cap.isOpened():
+            print(f"ERROR: Cannot open camera {camera_index}")
+            return
+        
+        print(f"Camera {camera_index} opened successfully!")
+        
+        # Scene configuration
+        MAX_OBJECTS = 2  # Fixed number of objects in the scene
+        print(f"\nScene Configuration: {MAX_OBJECTS} objects")
+        
+        print("\nControls:")
+        print("  'q' - Quit")
+        print("  's' - Save current diff_map")
+        print("  'd' - Toggle debug views")
+        print("  'c' - Clear/reset")
+        print("  'b' - Toggle blob detection overlay")
+        print("  't' - Toggle track visualization")
+        print("  'o' - Toggle object visualization")
+        print("  'i' - Toggle importance map visualization")
+        print("  'p' - Toggle predictive importance mapping")
+        print("  '1-9' - Set number of objects in scene")
+        print("  '+/-' - Increase/decrease prediction steps")
+        print()
+        
+        prev_gray = None
+        prev_blobs = []
+        show_debug = True
+        show_blobs = True
+        show_tracks = True
+        show_importance = False  # Toggle for importance map visualization
+        use_prediction = True  # Toggle for predictive importance
+        prediction_steps = 3  # Number of future frames to predict
+        frame_count = 0
+        saved_count = 0
+        max_objects = MAX_OBJECTS
+        
+        # Setup blob detector
+        blob_detector = setup_blob_detector()
+        
+        # Track management
+        tracks = []
+        unmatched_history = deque(maxlen=5)
+        last_frame_time = time.time()
+        
+        # Object management (higher level grouping of tracks)
+        objects = []
+        unmatched_tracks_history = deque(maxlen=3)
+        show_objects = True
+        
+        # Temporal smoothing for diff_map to reduce jumpiness
+        accumulated_diff = None
+        diff_alpha = 0.9  # Blending factor for temporal smoothing
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to read frame")
+                break
+            
+            frame_count += 1
+            gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+            
+            if prev_gray is not None:
+                # Calculate difference map
+                diff_map = mf.picture_diference(gray, prev_gray)
+                
+                # Process diff_map: normalize first
+                diff_map = cv.normalize(diff_map, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+                
+                # Apply temporal smoothing to reduce jumpiness from lighting/camera changes
+                if accumulated_diff is None:
+                    accumulated_diff = diff_map.astype(np.float32)
+                else:
+                    # Blend current diff with accumulated: new = alpha*current + (1-alpha)*previous
+                    accumulated_diff = diff_alpha * diff_map.astype(np.float32) + (1 - diff_alpha) * accumulated_diff
+                
+                # Use the smoothed diff map
+                diff_map_smoothed = accumulated_diff.astype(np.uint8)
+                
+                # Lighter blur to preserve detail
+                diff_map_smoothed = cv.GaussianBlur(diff_map_smoothed, (5, 5), 2)
+                
+                # Lower threshold to capture more subtle changes
+                diff_map_final = cv.threshold(diff_map_smoothed, 20, 255, cv.THRESH_BINARY)[1]
+                
+                # Detect blobs in the thresholded diff_map
+                keypoints = blob_detector.detect(diff_map_final)
+                
+                # Convert keypoints to BlobInfo objects with velocity calculation
+                current_time = time.time()
+                dt = current_time - last_frame_time
+                last_frame_time = current_time
+                
+                blobs = []
+                for kp in keypoints:
+                    blob = BlobInfo(kp, frame_count)
+                    
+                    # Calculate velocity by finding closest previous blob
+                    if prev_blobs:
+                        closest_dist = float('inf')
+                        closest_blob = None
+                        for prev_blob in prev_blobs:
+                            dist = np.linalg.norm(blob.pos - prev_blob.pos)
+                            if dist < closest_dist:
+                                closest_dist = dist
+                                closest_blob = prev_blob
+                        
+                        # Only calculate velocity if close enough (< 50 pixels)
+                        if closest_blob and closest_dist < 50:
+                            if dt > 0:
+                                blob.velocity = (blob.pos - closest_blob.pos) / dt
+                    
+                    blobs.append(blob)
+                
+                # Match blobs to existing tracks
+                track_assignments, unmatched_blobs = match_blobs_to_tracks(blobs, tracks, frame_count)
+                
+                # Update tracks with matched blobs
+                for track in tracks:
+                    if track.id in track_assignments:
+                        track.update(track_assignments[track.id], frame_count)
+                
+                # Update activity status for all tracks based on final diff_map
+                for track in tracks:
+                    track.update_activity_status(diff_map_final)
+                
+                # Add unmatched blobs to history
+                unmatched_history.append(unmatched_blobs)
+                
+                # Find persistent unmatched blobs that should become new tracks
+                # Keep permissive - tracks are like measurements, we'll filter later
+                persistent_blobs = find_persistent_blobs(unmatched_blobs, unmatched_history, 
+                                                        min_persistence=3, max_distance=50)
+                
+                # Create new tracks for persistent blobs
+                for persistent_blob in persistent_blobs:
+                    # Don't create track if it's extremely close to existing one
+                    too_close_to_existing = False
+                    for existing_track in tracks:
+                        dist = np.linalg.norm(persistent_blob.pos - existing_track.position)
+                        if dist < 30:  # Only reject if very close
+                            too_close_to_existing = True
+                            break
+                    
+                    if not too_close_to_existing:
+                        new_track = Track(persistent_blob, frame_count)
+                        tracks.append(new_track)
+                        print(f"Created new track #{new_track.id}")
+                
+                # Remove dead tracks
+                alive_tracks = [t for t in tracks if t.is_alive(frame_count)]
+                
+                # Initialize valuable_track_ids as empty
+                valuable_track_ids = set()
+                
+                # === OBJECT LEVEL TRACKING (Fixed number of objects) ===
+                # Initialize objects if needed (first tracks appear)
+                if len(objects) < max_objects and len(alive_tracks) > 0:
+                    # Create objects from first tracks seen
+                    for track in alive_tracks:
+                        if len(objects) >= max_objects:
+                            break
+                        
+                        # Check if this track is far from existing objects
+                        too_close = False
+                        for obj in objects:
+                            if np.linalg.norm(track.position - obj.position) < 100:
+                                too_close = True
+                                break
+                        
+                        if not too_close:
+                            new_object = Object(track, frame_count)
+                            # Initialize object's importance map with frame dimensions
+                            height, width = gray.shape
+                            # Fast decay for positive (85%), slow for negative (98%), very fast for predictions (75%)
+                            new_object.importance_map = ImportanceMap(width, height, 
+                                                                    positive_decay=0.85, 
+                                                                    negative_decay=0.98,
+                                                                    prediction_decay=0.75)
+                            objects.append(new_object)
+                            print(f"Initialized object #{new_object.id} at pos {track.position}")
+                
+                # Match all tracks to the fixed set of objects
+                if alive_tracks and objects:
+                    object_assignments, unmatched_tracks = match_tracks_to_objects(
+                        alive_tracks, objects, frame_count, min_score=20
+                    )
+                    
+                    # Update objects with matched tracks (multi-track fusion)
+                    for obj in objects:
+                        if obj.id in object_assignments and object_assignments[obj.id]:
+                            # Pass all candidate tracks to object for correlation-based fusion
+                            obj.update(object_assignments[obj.id], frame_count, correlation_threshold=0.35)
+                        else:
+                            # Object had no matching tracks this frame
+                            obj.update([], frame_count)
+                    
+                    # Update categorization: valuable = in any object's track pool
+                    valuable_track_ids.clear()
+                    for obj in objects:
+                        # Include all tracks actively contributing to this object
+                        valuable_track_ids.update([t.id for t in obj.track_pool])
+                        
+                        # Update this object's importance map with prediction
+                        obj.update_importance_map(alive_tracks, 
+                                                valuable_score=5.0, 
+                                                unimportant_score=-3.0,
+                                                use_prediction=use_prediction,
+                                                prediction_steps=prediction_steps)
+                
+                # Objects never get removed - they represent the fixed scene entities
+                
+                tracks = alive_tracks
+                
+                # Store blobs for next frame
+                prev_blobs = blobs
+                
+                # Display smoothed diff_map (final processed version)
+                cv.imshow("Diff Map", diff_map_final)
+                
+                # Create visualization frame
+                vis_frame = frame.copy()
+                
+                # Draw blobs if enabled
+                if show_blobs and keypoints:
+                    for kp in keypoints:
+                        x, y = int(kp.pt[0]), int(kp.pt[1])
+                        size = int(kp.size)
+                        cv.circle(vis_frame, (x, y), size, (0, 255, 0), 2)
+                        cv.circle(vis_frame, (x, y), 3, (0, 0, 255), -1)
+                
+                # Draw tracks if enabled (with categorization and certainty)
+                if show_tracks and tracks:
+                    # Pre-calculate track scores for their assigned objects
+                    track_scores = {}
+                    if objects:
+                        for obj in objects:
+                            for track in obj.track_pool:
+                                score = calculate_track_object_score(track, obj, frame_count)
+                                track_scores[track.id] = score
+                    
+                    for track in tracks:
+                        # Check if track is valuable (assigned to an object) or noise
+                        is_valuable = track.id in valuable_track_ids if 'valuable_track_ids' in locals() else False
+                        
+                        # Get certainty for visual feedback
+                        certainty = track.get_certainty()
+                        
+                        # Get score if track is assigned to an object
+                        track_score = track_scores.get(track.id, 0) if is_valuable else 0
+                        
+                        # Color: GREEN only if valuable (in object), otherwise GRAY
+                        if is_valuable:
+                            # Pure green for valuable tracks
+                            ring_color = (0, 255, 0)
+                        else:
+                            # Gray for noise tracks
+                            ring_color = (100, 100, 100)
+                        
+                        # Use original track color for center dot
+                        track_color = track.color if is_valuable else (80, 80, 80)
+                        
+                        # Draw track history trail (thickness based on certainty)
+                        if len(track.position_history) > 1:
+                            # position_history stores (pos, frame_id) tuples
+                            points = [tuple(map(int, pos_frame[0])) for pos_frame in track.position_history]
+                            line_thickness = max(1, int(certainty * 3)) if is_valuable else 1
+                            for i in range(len(points) - 1):
+                                cv.line(vis_frame, points[i], points[i + 1], track_color, line_thickness)
+                        
+                        # Draw current position (fixed small size)
+                        pos = tuple(map(int, track.position))
+                        circle_size = 4 if is_valuable else 3
+                        cv.circle(vis_frame, pos, circle_size, track_color, -1)
+                        
+                        # Outer ring: size based on SCORE, thickness based on CERTAINTY, color based on valuable/noise
+                        if is_valuable:
+                            # Ring radius scales with score (normalized to 0-100 range, giving 2-12 pixel ring)
+                            normalized_score = min(track_score / 100.0, 1.0)  # Normalize assuming max ~100
+                            ring_radius = circle_size + int(2 + normalized_score * 10)
+                            ring_thickness = max(1, int(certainty * 3))
+                        else:
+                            ring_radius = circle_size + 2
+                            ring_thickness = 1
+                        
+                        cv.circle(vis_frame, pos, ring_radius, ring_color, ring_thickness)
+                        
+                        # Draw velocity vector if significant (only for valuable tracks)
+                        if is_valuable:
+                            speed = track.get_speed()
+                            if speed > 5:  # Only draw if moving
+                                end_pos = tuple(map(int, track.position + track.velocity * 0.3))
+                                cv.arrowedLine(vis_frame, pos, end_pos, track_color, 2, tipLength=0.3)
+                        
+                        # Draw track ID (smaller for noise)
+                        font_scale = 0.5 if is_valuable else 0.3
+                        cv.putText(vis_frame, f"#{track.id}", 
+                                (pos[0] + 15, pos[1] - 10),
+                                cv.FONT_HERSHEY_SIMPLEX, font_scale, track_color, 2 if is_valuable else 1)
+                
+                # Draw objects if enabled (multi-track fusion visualization)
+                if show_objects and objects:
+                    for obj in objects:
+                        # Draw lines connecting object to its active track pool
+                        obj_pos = tuple(map(int, obj.position))
+                        for track in obj.track_pool:
+                            track_pos = tuple(map(int, track.position))
+                            # Line thickness based on track certainty
+                            certainty = track.get_certainty()
+                            correlation = obj.calculate_track_correlation(track)
+                            line_thickness = max(1, int(correlation * certainty * 3))
+                            cv.line(vis_frame, obj_pos, track_pos, obj.color, line_thickness)
+                        
+                        # Draw large circle representing the fused object position
+                        cv.circle(vis_frame, obj_pos, 35, obj.color, 4)
+                        
+                        # Draw velocity vector
+                        speed = obj.get_speed()
+                        if speed > 3:
+                            end_pos = tuple(map(int, obj.position + obj.velocity * 0.5))
+                            cv.arrowedLine(vis_frame, obj_pos, end_pos, obj.color, 4, tipLength=0.3)
+                        
+                        # Draw object ID and active track pool size
+                        active_tracks = len(obj.track_pool)
+                        cv.putText(vis_frame, f"OBJ #{obj.id} [{active_tracks} tracks]", 
+                                (obj_pos[0] - 50, obj_pos[1] - 45),
+                                cv.FONT_HERSHEY_SIMPLEX, 0.7, obj.color, 2)
+                        
+                        # Show track IDs in pool (for debugging)
+                        if active_tracks > 0:
+                            track_ids = ",".join([f"#{t.id}" for t in obj.track_pool[:5]])  # Show first 5
+                            cv.putText(vis_frame, track_ids, 
+                                    (obj_pos[0] - 50, obj_pos[1] + 50),
+                                    cv.FONT_HERSHEY_SIMPLEX, 0.4, obj.color, 1)
+                
+                # Debug views
+                if show_debug:
+                    colored_diff = cv.applyColorMap(diff_map_final, cv.COLORMAP_JET)
+                    cv.imshow("Diff Map (Colored)", colored_diff)
+                    
+                    overlay = cv.addWeighted(frame, 0.3, colored_diff, 0.7, 0)
+                    cv.imshow("Overlay", overlay)
+                
+                # Importance map visualization (show combined map of all objects)
+                if show_importance and objects:
+                    # Create combined maps from all objects (three layers)
+                    height, width = gray.shape
+                    combined_positive = np.zeros((height, width), dtype=np.float32)
+                    combined_negative = np.zeros((height, width), dtype=np.float32)
+                    combined_prediction = np.zeros((height, width), dtype=np.float32)
+                    
+                    for obj in objects:
+                        if obj.importance_map:
+                            combined_positive += obj.importance_map.positive_map
+                            combined_negative += obj.importance_map.negative_map
+                            combined_prediction += obj.importance_map.prediction_map
+                    
+                    # Create full combined view (positive + prediction - negative)
+                    full_combined = combined_positive + combined_prediction - combined_negative
+                    combined_vis = np.clip(full_combined, -20, 20)
+                    map_min = combined_vis.min()
+                    map_max = combined_vis.max()
+                    if map_max > map_min:
+                        combined_vis = ((combined_vis - map_min) / (map_max - map_min) * 255).astype(np.uint8)
+                    else:
+                        combined_vis = np.zeros_like(combined_vis, dtype=np.uint8)
+                    
+                    importance_colored = cv.applyColorMap(combined_vis, cv.COLORMAP_JET)
+                    importance_overlay = cv.addWeighted(frame, 0.4, importance_colored, 0.6, 0)
+                    
+                    label_text = f"Combined Importance ({len(objects)} objects)"
+                    cv.putText(importance_overlay, label_text, 
+                            (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    
+                    cv.imshow("Combined Importance Map", importance_overlay)
+                    
+                    # Show PREDICTION layer separately if prediction is enabled
+                    if use_prediction and np.max(combined_prediction) > 0.1:
+                        pred_vis = np.clip(combined_prediction, 0, 20)
+                        if pred_vis.max() > 0:
+                            pred_vis = (pred_vis / pred_vis.max() * 255).astype(np.uint8)
+                        else:
+                            pred_vis = np.zeros_like(pred_vis, dtype=np.uint8)
+                        
+                        # Use HOT colormap for predictions (black -> red -> yellow -> white)
+                        pred_colored = cv.applyColorMap(pred_vis, cv.COLORMAP_HOT)
+                        pred_overlay = cv.addWeighted(frame, 0.5, pred_colored, 0.5, 0)
+                        
+                        cv.putText(pred_overlay, f"Prediction Corridors ({prediction_steps} steps)", 
+                                (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                        cv.putText(pred_overlay, "Red/Yellow = Predicted positions", 
+                                (10, 60), cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                        
+                        cv.imshow("Prediction Corridors", pred_overlay)
+                    else:
+                        try:
+                            cv.destroyWindow("Prediction Corridors")
+                        except:
+                            pass
+                        
+                elif not show_importance:
+                    # Close importance map windows if toggled off
+                    try:
+                        cv.destroyWindow("Combined Importance Map")
+                        cv.destroyWindow("Prediction Corridors")
+                    except:
+                        pass
+                
+                # Statistics
+                mean_diff = np.mean(diff_map_final)
+                max_diff = np.max(diff_map_final)
+                num_blobs = len(keypoints)
+                
+                # Info text
+                cv.putText(vis_frame, f"Frame: {frame_count}", (10, 30), 
+                        cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv.putText(vis_frame, f"Blobs: {num_blobs}", (10, 60), 
+                        cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                # Count valuable vs noise tracks
+                num_valuable = len(valuable_track_ids) if 'valuable_track_ids' in locals() else 0
+                num_noise = len(tracks) - num_valuable
+                
+                cv.putText(vis_frame, f"Tracks: {len(tracks)} ({num_valuable} valuable, {num_noise} noise)", (10, 90), 
+                        cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv.putText(vis_frame, f"Objects: {len(objects)}/{max_objects}", (10, 120), 
+                        cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv.putText(vis_frame, f"Mean: {mean_diff:.1f} Max: {max_diff:.1f}", (10, 150), 
+                        cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv.putText(vis_frame, f"Blobs: {'ON' if show_blobs else 'OFF'} (b)", (10, 180), 
+                        cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv.putText(vis_frame, f"Tracks: {'ON' if show_tracks else 'OFF'} (t)", (10, 210), 
+                        cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv.putText(vis_frame, f"Objects: {'ON' if show_objects else 'OFF'} (o)", (10, 240), 
+                        cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv.putText(vis_frame, f"Importance: {'ON' if show_importance else 'OFF'} (i)", (10, 270), 
+                        cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv.putText(vis_frame, f"Prediction: {'ON' if use_prediction else 'OFF'} (p) Steps: {prediction_steps} (+/-)", (10, 300), 
+                        cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                
+                cv.imshow("Frame with Blobs", vis_frame)
+            else:
+                # First frame
+                cv.putText(frame, "Capturing first frame...", (10, 30), 
+                        cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv.imshow("Frame with Blobs", frame)
+            
+            prev_gray = gray.copy()
+            
+            # Keyboard input
+            key = cv.waitKey(1) & 0xFF
+            
+            if key == ord('q'):
+                print("Quitting...")
+                break
+            elif key == ord('s'):
+                if 'diff_map_final' in locals():
+                    filename = f"diff_map_{saved_count:03d}.png"
+                    cv.imwrite(filename, diff_map_final)
+                    print(f"Saved: {filename}")
+                    saved_count += 1
+            elif key == ord('d'):
+                show_debug = not show_debug
+                print(f"Debug views: {'ON' if show_debug else 'OFF'}")
+                if not show_debug:
+                    cv.destroyWindow("Diff Map (Colored)")
+                    cv.destroyWindow("Overlay")
+            elif key == ord('b'):
+                show_blobs = not show_blobs
+                print(f"Blob detection: {'ON' if show_blobs else 'OFF'}")
+            elif key == ord('t'):
+                show_tracks = not show_tracks
+                print(f"Track visualization: {'ON' if show_tracks else 'OFF'}")
+            elif key == ord('o'):
+                show_objects = not show_objects
+                print(f"Object visualization: {'ON' if show_objects else 'OFF'}")
+            elif key == ord('i'):
+                show_importance = not show_importance
+                print(f"Importance map: {'ON' if show_importance else 'OFF'}")
+            elif key == ord('p'):
+                use_prediction = not use_prediction
+                print(f"Predictive importance: {'ON' if use_prediction else 'OFF'}")
+            elif key == ord('+') or key == ord('='):
+                prediction_steps = min(10, prediction_steps + 1)
+                print(f"Prediction steps: {prediction_steps}")
+            elif key == ord('-') or key == ord('_'):
+                prediction_steps = max(1, prediction_steps - 1)
+                print(f"Prediction steps: {prediction_steps}")
+            elif key >= ord('1') and key <= ord('9'):
+                # Change max number of objects in scene
+                new_max = key - ord('0')
+                if new_max != max_objects:
+                    max_objects = new_max
+                    # Remove excess objects if reducing
+                    if len(objects) > max_objects:
+                        objects = objects[:max_objects]
+                    print(f"Max objects set to: {max_objects}")
+            elif key == ord('c'):
+                prev_gray = None
+                tracks.clear()
+                prev_blobs = []
+                unmatched_history.clear()
+                unmatched_tracks_history.clear()
+                accumulated_diff = None  # Reset temporal smoothing
+                Track.next_id = 0
+                # Reset all object importance maps before clearing
+                for obj in objects:
+                    if obj.importance_map:
+                        obj.importance_map.reset()
+                objects.clear()
+                Object.next_id = 0
+                print("Reset - cleared previous frame, all tracks, objects, importance maps, and temporal buffer")
+        
+        cap.release()
+        cv.destroyAllWindows()
+        print(f"\nProcessed {frame_count} frames")
+        print(f"Saved {saved_count} diff_maps")
+        print(f"Total tracks created: {Track.next_id}")
+        print(f"Total objects created: {Object.next_id}")
+
     print("=" * 60)
     print("Diff Map Demo")
     print("=" * 60)
