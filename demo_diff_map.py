@@ -822,11 +822,15 @@ if __name__ == "__main__":
 
     def main():
         camera_index = 0
-        cap = cv.VideoCapture(camera_index)
+        print("1")
+        # Use DirectShow backend on Windows to prevent freezing during camera enumeration
+        cap = cv.VideoCapture(camera_index, cv.CAP_DSHOW)
+        print("2")
         
         if not cap.isOpened():
             print(f"ERROR: Cannot open camera {camera_index}")
             return
+        print("3")
         
         print(f"Camera {camera_index} opened successfully!")
         

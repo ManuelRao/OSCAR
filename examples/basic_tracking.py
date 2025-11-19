@@ -34,8 +34,8 @@ def main():
     # 3. Create visualizer
     visualizer = TrackingVisualizer(tracker)
     
-    # 4. Open webcam
-    cap = cv.VideoCapture(0)
+    # 4. Open webcam (use DirectShow backend on Windows for faster/reliable access)
+    cap = cv.VideoCapture(0, cv.CAP_DSHOW)
     if not cap.isOpened():
         print("Error: Cannot open webcam")
         return
