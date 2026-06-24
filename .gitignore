@@ -1,0 +1,4 @@
+# Compiled Python files and cache
+__pycache__/
+*.py[cod]
+*$py.class
